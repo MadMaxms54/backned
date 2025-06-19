@@ -12,7 +12,7 @@ const app = express();
 const server = http.createServer(app);
 
 // MongoDB Atlas connection
-const MONGODB_URI = process.env.MONGODB_URI || 'mmongodb+srv://makkakalanguappa:muthu5454@cluster0.zx043tc.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0';
+const MONGODB_URI =  'mongodb+srv://makkakalanguappa:muthu5454@cluster0.zx043tc.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0';
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
 const client = new MongoClient(MONGODB_URI, {
@@ -203,7 +203,7 @@ app.get('/api/search', apiLimiter, async (req, res) => {
   if (!query) return res.status(400).json({ error: 'Missing search query' });
 
   try {
-    const response = await axios.get('https://web-production-0b6a6.up.railway.app/result/', {
+    const response = await axios.get('https://flask-uvpu.onrender.com/result', {
       params: { query, lyrics: true },
       timeout: 5000
     });
@@ -456,7 +456,7 @@ app.get('/api/rooms', apiLimiter, async (req, res) => {
 // ---- Enhanced Socket.IO with MongoDB ----
 io.use(async (socket, next) => {
   const { roomId, userId } = socket.handshake.auth;
-  if (!validateRoomId(roomId)) {
+  if (!validateRoomId(roomId) ){
     return next(new Error('Invalid room ID'));
   }
   
