@@ -6,35 +6,42 @@ const http = require('http');
 const { Server } = require('socket.io');
 const rateLimit = require('express-rate-limit');
 const mongoose = require('mongoose');
-const { MongoClient } = require('mongodb');
+const { MongoClient, ServerApiVersion } = require('mongodb');
 
 const app = express();
 const server = http.createServer(app);
 
-// MongoDB connection setup
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://makkakalanguappa:muthu5454@cluster0.zx043tc.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0';
-const mongoClient = new MongoClient(MONGODB_URI);
-let db;
+// MongoDB Atlas connection
+const MONGODB_URI = process.env.MONGODB_URI || 'mmongodb+srv://makkakalanguappa:muthu5454@cluster0.zx043tc.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0';
+
+// Create a MongoClient with a MongoClientOptions object to set the Stable API version
+const client = new MongoClient(MONGODB_URI, {
+  serverApi: {
+    version: ServerApiVersion.v1,
+    strict: true,
+    deprecationErrors: true,
+  }
+});
 
 // Connect to MongoDB
 async function connectToMongoDB() {
   try {
-    await mongoClient.connect();
-    db = mongoClient.db();
-    console.log('Connected to MongoDB');
+    await client.connect();
+    console.log('Connected to MongoDB Atlas');
     
-    // Create indexes
+    // Create collections if they don't exist
+    const db = client.db();
     await db.collection('rooms').createIndex({ roomId: 1 }, { unique: true });
-    await db.collection('users').createIndex({ userId: 1 });
     await db.collection('room_stats').createIndex({ roomId: 1 }, { unique: true });
+    await db.collection('user_sessions').createIndex({ userId: 1, roomId: 1 }, { unique: true });
     
-    // Initialize Mongoose for potential schema-based operations
-    mongoose.connect(MONGODB_URI);
   } catch (err) {
     console.error('MongoDB connection error:', err);
     process.exit(1);
   }
 }
+
+connectToMongoDB();
 
 // Rate limiting
 const apiLimiter = rateLimit({
@@ -63,187 +70,132 @@ app.use(express.json());
 // Simple root route for testing
 app.get('/', (req, res) => {
   res.json({ 
-    message: 'Enhanced Music Room Server with MongoDB is running!',
-    version: '2.1.0',
+    message: 'Enhanced Music Room Server is running!',
+    version: '2.0.0',
     features: [
       'Real-time synchronized music playback',
       'Queue management with user requests',
-      'Room statistics and analytics with MongoDB storage',
+      'Room statistics and analytics',
       'Enhanced user management',
       'Auto-promotion when admin leaves',
-      'Persistent room data'
+      'MongoDB Atlas storage'
     ]
   });
 });
-
-// In-memory cache for active rooms (we'll sync with MongoDB)
-const activeRooms = {};
 
 // Helper functions
 const validateRoomId = (roomId) => /^[A-Z0-9]{6}$/.test(roomId);
 const validateUserId = (userId) => typeof userId === 'string' && userId.length > 0;
 
-// MongoDB CRUD Operations
-const RoomDB = {
-  // Save or update a room
-  async saveRoom(roomData) {
-    try {
-      await db.collection('rooms').updateOne(
-        { roomId: roomData.roomId },
-        { $set: roomData },
-        { upsert: true }
-      );
-    } catch (err) {
-      console.error('Error saving room to MongoDB:', err);
-    }
-  },
+// MongoDB Room Operations
+async function getRoom(roomId) {
+  const db = client.db();
+  const room = await db.collection('rooms').findOne({ roomId });
+  return room;
+}
 
-  // Get a room by ID
-  async getRoom(roomId) {
-    try {
-      return await db.collection('rooms').findOne({ roomId });
-    } catch (err) {
-      console.error('Error getting room from MongoDB:', err);
-      return null;
-    }
-  },
+async function createRoom(roomData) {
+  const db = client.db();
+  await db.collection('rooms').insertOne(roomData);
+  
+  // Initialize room statistics
+  await db.collection('room_stats').insertOne({
+    roomId: roomData.roomId,
+    totalUsers: 1,
+    totalSongsPlayed: 0,
+    totalPlayTime: 0,
+    createdAt: new Date().toISOString(),
+    lastSongPlayed: null,
+    lastActivity: new Date().toISOString()
+  });
+}
 
-  // Delete a room
-  async deleteRoom(roomId) {
-    try {
-      await db.collection('rooms').deleteOne({ roomId });
-    } catch (err) {
-      console.error('Error deleting room from MongoDB:', err);
-    }
-  },
+async function updateRoom(roomId, updateData) {
+  const db = client.db();
+  await db.collection('rooms').updateOne(
+    { roomId },
+    { $set: { ...updateData, lastActivity: new Date().toISOString() } }
+  );
+  
+  // Also update last activity in stats
+  await db.collection('room_stats').updateOne(
+    { roomId },
+    { $set: { lastActivity: new Date().toISOString() } }
+  );
+}
 
-  // Get all active rooms
-  async getActiveRooms() {
-    try {
-      return await db.collection('rooms').find({}).toArray();
-    } catch (err) {
-      console.error('Error getting active rooms from MongoDB:', err);
-      return [];
-    }
-  }
-};
+async function deleteRoom(roomId) {
+  const db = client.db();
+  await db.collection('rooms').deleteOne({ roomId });
+  await db.collection('room_stats').deleteOne({ roomId });
+}
 
-const RoomStatsDB = {
-  // Save or update room statistics
-  async saveStats(roomId, stats) {
-    try {
-      await db.collection('room_stats').updateOne(
-        { roomId },
-        { $set: stats },
-        { upsert: true }
-      );
-    } catch (err) {
-      console.error('Error saving room stats to MongoDB:', err);
-    }
-  },
+async function updateRoomStats(roomId, updateData) {
+  const db = client.db();
+  await db.collection('room_stats').updateOne(
+    { roomId },
+    { $set: updateData }
+  );
+}
 
-  // Get room statistics
-  async getStats(roomId) {
-    try {
-      return await db.collection('room_stats').findOne({ roomId });
-    } catch (err) {
-      console.error('Error getting room stats from MongoDB:', err);
-      return null;
-    }
-  },
+async function getRoomStats(roomId) {
+  const db = client.db();
+  return await db.collection('room_stats').findOne({ roomId });
+}
 
-  // Update room statistics when a song is played
-  async recordSongPlayed(roomId, song) {
-    try {
-      await db.collection('room_stats').updateOne(
-        { roomId },
-        { 
-          $inc: { totalSongsPlayed: 1 },
-          $set: { lastSongPlayed: new Date().toISOString() },
-          $push: { 
-            playedSongs: {
-              songId: song.id || song._id,
-              title: song.title,
-              artist: song.artist,
-              playedAt: new Date().toISOString()
-            }
-          }
-        },
-        { upsert: true }
-      );
-    } catch (err) {
-      console.error('Error recording song play in MongoDB:', err);
-    }
-  }
-};
+// User session management
+async function createUserSession(userId, roomId, socketId) {
+  const db = client.db();
+  await db.collection('user_sessions').insertOne({
+    userId,
+    roomId,
+    socketId,
+    joinedAt: new Date().toISOString(),
+    lastActivity: new Date().toISOString()
+  });
+}
 
-const UserDB = {
-  // Save or update user session
-  async saveUserSession(userId, roomId) {
-    try {
-      await db.collection('users').updateOne(
-        { userId },
-        { 
-          $set: { 
-            lastActive: new Date().toISOString(),
-            currentRoom: roomId 
-          },
-          $inc: { sessionCount: 1 }
-        },
-        { upsert: true }
-      );
-    } catch (err) {
-      console.error('Error saving user session to MongoDB:', err);
-    }
-  },
+async function updateUserSession(userId, roomId, updateData) {
+  const db = client.db();
+  await db.collection('user_sessions').updateOne(
+    { userId, roomId },
+    { $set: { ...updateData, lastActivity: new Date().toISOString() } }
+  );
+}
 
-  // Remove user from room (when they leave)
-  async removeUserFromRoom(userId) {
-    try {
-      await db.collection('users').updateOne(
-        { userId },
-        { $unset: { currentRoom: "" } }
-      );
-    } catch (err) {
-      console.error('Error removing user from room in MongoDB:', err);
-    }
-  }
-};
+async function deleteUserSession(userId, roomId) {
+  const db = client.db();
+  await db.collection('user_sessions').deleteOne({ userId, roomId });
+}
 
-// Room cleanup with MongoDB sync
+// Room cleanup job - runs every 10 minutes
 setInterval(async () => {
   try {
-    // Clean up in-memory rooms that are empty
-    for (const roomId in activeRooms) {
-      if (activeRooms[roomId].users.length === 0) {
-        // Save final stats before cleanup
-        if (activeRooms[roomId].stats) {
-          await RoomStatsDB.saveStats(roomId, activeRooms[roomId].stats);
-        }
-        
-        // Mark room as inactive in MongoDB (we don't delete for historical data)
-        await RoomDB.saveRoom({
-          ...activeRooms[roomId],
-          isActive: false,
-          endedAt: new Date().toISOString()
-        });
-        
-        delete activeRooms[roomId];
-        console.log(`Cleaned up empty room ${roomId}`);
-      }
+    const db = client.db();
+    const inactiveThreshold = new Date(Date.now() - 30 * 60 * 1000); // 30 minutes
+    
+    // Find inactive rooms
+    const inactiveRooms = await db.collection('rooms').find({
+      lastActivity: { $lt: inactiveThreshold.toISOString() }
+    }).toArray();
+    
+    // Delete inactive rooms and their stats
+    for (const room of inactiveRooms) {
+      console.log(`Cleaning up inactive room ${room.roomId}`);
+      await db.collection('rooms').deleteOne({ roomId: room.roomId });
+      await db.collection('room_stats').deleteOne({ roomId: room.roomId });
     }
     
-    // Also clean up any rooms in MongoDB that have been inactive for >24 hours
-    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    await db.collection('rooms').deleteMany({ 
-      isActive: false, 
-      endedAt: { $lt: twentyFourHoursAgo } 
+    // Clean up user sessions for active rooms
+    const activeRoomIds = (await db.collection('rooms').find().toArray()).map(r => r.roomId);
+    await db.collection('user_sessions').deleteMany({
+      roomId: { $nin: activeRoomIds }
     });
     
   } catch (err) {
-    console.error('Error during room cleanup:', err);
+    console.error('Room cleanup error:', err);
   }
-}, 60000); // Run every minute
+}, 10 * 60 * 1000); // Run every 10 minutes
 
 // ---- Enhanced APIs ----
 app.get('/api/search', apiLimiter, async (req, res) => {
@@ -258,26 +210,7 @@ app.get('/api/search', apiLimiter, async (req, res) => {
     res.json(response.data);
   } catch (err) {
     console.error('Search error:', err.message);
-    // Provide demo results if the external API fails
-    const demoResults = [
-      {
-        id: 'demo1',
-        title: 'Demo Song 1',
-        artist: 'Demo Artist',
-        cover: 'https://via.placeholder.com/150',
-        mediaUrl: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3',
-        _id: 'demo1'
-      },
-      {
-        id: 'demo2',
-        title: 'Demo Song 2',
-        artist: 'Demo Artist',
-        cover: 'https://via.placeholder.com/150',
-        mediaUrl: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3',
-        _id: 'demo2'
-      }
-    ];
-    res.json({ songs: demoResults });
+    res.status(500).json({ error: 'Failed to fetch data from external API' });
   }
 });
 
@@ -309,7 +242,7 @@ app.get('/api/playlist', apiLimiter, async (req, res) => {
   }
 });
 
-// Enhanced room creation with MongoDB storage
+// Enhanced room creation with MongoDB
 app.post('/api/start-room', apiLimiter, async (req, res) => {
   const { userId, password, roomName } = req.body;
   if (!validateUserId(userId)) return res.status(400).json({ error: 'Invalid userId' });
@@ -324,7 +257,6 @@ app.post('/api/start-room', apiLimiter, async (req, res) => {
     roomName: roomName || `Room ${roomId}`,
     createdAt: new Date().toISOString(),
     lastActivity: new Date().toISOString(),
-    isActive: true,
     playbackState: {
       isPlaying: false,
       position: 0,
@@ -334,125 +266,105 @@ app.post('/api/start-room', apiLimiter, async (req, res) => {
     settings: {
       autoPlay: true,
       shuffle: false,
-      repeat: 'none', // none, one, all
+      repeat: 'none',
       maxUsers: 50,
-      allowUserRequests: true
+      allowUserRequests: false
     }
   };
 
-  // Save to in-memory cache and MongoDB
-  activeRooms[roomId] = roomData;
-  await RoomDB.saveRoom(roomData);
-  
-  // Initialize room statistics
-  const initialStats = {
-    roomId,
-    totalUsers: 1,
-    totalSongsPlayed: 0,
-    totalPlayTime: 0,
-    createdAt: new Date().toISOString(),
-    lastSongPlayed: null,
-    playedSongs: []
-  };
-  
-  activeRooms[roomId].stats = initialStats;
-  await RoomStatsDB.saveStats(roomId, initialStats);
-  
-  // Save user session
-  await UserDB.saveUserSession(userId, roomId);
-
-  res.status(200).json({ 
-    message: 'Room created successfully', 
-    roomId, 
-    users: roomData.users,
-    hasPassword: !!password,
-    roomName: roomData.roomName,
-    settings: roomData.settings,
-    currentSong: roomData.currentSong,
-    playbackState: roomData.playbackState
-  });
+  try {
+    await createRoom(roomData);
+    await createUserSession(userId, roomId, null);
+    
+    res.status(200).json({ 
+      message: 'Room created successfully', 
+      roomId, 
+      users: roomData.users,
+      hasPassword: !!password,
+      roomName: roomData.roomName,
+      settings: roomData.settings,
+      currentSong: roomData.currentSong,
+      playbackState: roomData.playbackState
+    });
+  } catch (err) {
+    console.error('Room creation error:', err);
+    res.status(500).json({ error: 'Failed to create room' });
+  }
 });
 
-// Enhanced room joining with MongoDB sync
+// Enhanced room joining with MongoDB
 app.post('/api/join-room', apiLimiter, async (req, res) => {
   const { userId, roomId, password } = req.body;
   
-  console.log('Join room request:', { userId, roomId, password, passwordType: typeof password });
+  if (!validateUserId(userId)) {
+    return res.status(400).json({ error: 'Invalid userId' });
+  }
   
-  if (!validateUserId(userId) || !validateRoomId(roomId)) {
-    return res.status(400).json({ error: 'Invalid request parameters' });
+  if (!validateRoomId(roomId)) {
+    return res.status(400).json({ error: 'Invalid room ID' });
   }
 
-  // Check if room is in active cache, if not try to load from MongoDB
-  let room = activeRooms[roomId];
-  if (!room) {
-    const dbRoom = await RoomDB.getRoom(roomId);
-    if (dbRoom && dbRoom.isActive) {
-      activeRooms[roomId] = dbRoom;
-      room = dbRoom;
+  try {
+    const room = await getRoom(roomId);
+    if (!room) return res.status(404).json({ error: 'Room not found' });
+    
+    if (room.password && room.password !== password) {
+      return res.status(403).json({ error: 'Incorrect room password' });
     }
-  }
-  
-  if (!room) return res.status(404).json({ error: 'Room not found' });
-  
-  // Force allow user requests for all rooms
-  room.settings.allowUserRequests = true;
 
-  console.log('Room data:', { 
-    roomPassword: room.password, 
-    roomPasswordType: typeof room.password,
-    hasPassword: !!room.password,
-    passwordMatch: room.password === password
-  });
-  
-  if (room.password && room.password !== password) {
-    console.log('Password check failed - returning 403');
-    return res.status(403).json({ error: 'Incorrect room password' });
-  }
+    // Check room capacity
+    if (room.users.length >= room.settings.maxUsers) {
+      return res.status(403).json({ error: 'Room is full' });
+    }
 
-  // Check room capacity
-  if (room.users.length >= room.settings.maxUsers) {
-    return res.status(403).json({ error: 'Room is full' });
-  }
+    const userExists = room.users.some(u => u.id === userId);
+    if (!userExists) {
+      const newUser = { 
+        id: userId, 
+        isAdmin: false, 
+        socketId: null, 
+        joinedAt: new Date().toISOString() 
+      };
+      
+      await updateRoom(roomId, {
+        users: [...room.users, newUser],
+        lastActivity: new Date().toISOString()
+      });
+      
+      // Update room statistics
+      const stats = await getRoomStats(roomId);
+      if (stats) {
+        await updateRoomStats(roomId, {
+          totalUsers: Math.max(stats.totalUsers, room.users.length + 1)
+        });
+      }
+      
+      // Create user session
+      await createUserSession(userId, roomId, null);
+    }
 
-  const exists = room.users.find(u => u.id === userId);
-  if (!exists) {
-    room.users.push({ 
-      id: userId, 
-      isAdmin: false, 
-      socketId: null, 
-      joinedAt: new Date().toISOString() 
+    res.status(200).json({ 
+      message: 'Joined room successfully', 
+      roomId, 
+      users: userExists ? room.users : [...room.users, { 
+        id: userId, 
+        isAdmin: false, 
+        socketId: null, 
+        joinedAt: new Date().toISOString() 
+      }],
+      currentSong: room.currentSong,
+      playbackState: room.playbackState,
+      settings: room.settings,
+      roomName: room.roomName,
+      queue: room.queue
     });
-    
-    // Update room statistics
-    if (room.stats) {
-      room.stats.totalUsers = Math.max(room.stats.totalUsers, room.users.length);
-      await RoomStatsDB.saveStats(roomId, room.stats);
-    }
-    
-    // Save user session
-    await UserDB.saveUserSession(userId, roomId);
-    
-    // Update room in MongoDB
-    await RoomDB.saveRoom(room);
+  } catch (err) {
+    console.error('Join room error:', err);
+    res.status(500).json({ error: 'Failed to join room' });
   }
-
-  room.lastActivity = new Date().toISOString();
-
-  console.log('Join successful - returning 200');
-  res.status(200).json({ 
-    message: 'Joined room successfully', 
-    roomId, 
-    users: room.users,
-    currentSong: room.currentSong,
-    playbackState: room.playbackState,
-    settings: room.settings,
-    roomName: room.roomName,
-    queue: room.queue
-  });
 });
 
-// New API: Get room statistics
+// Get room statistics
 app.get('/api/room/:roomId/stats', apiLimiter, async (req, res) => {
   const { roomId } = req.params;
   
@@ -460,25 +372,30 @@ app.get('/api/room/:roomId/stats', apiLimiter, async (req, res) => {
     return res.status(400).json({ error: 'Invalid room ID' });
   }
 
-  const room = activeRooms[roomId];
-  if (!room) return res.status(404).json({ error: 'Room not found' });
+  try {
+    const room = await getRoom(roomId);
+    if (!room) return res.status(404).json({ error: 'Room not found' });
 
-  const stats = room.stats || await RoomStatsDB.getStats(roomId) || {};
-  res.json({
-    roomId,
-    currentUsers: room.users.length,
-    totalUsers: stats.totalUsers || 0,
-    totalSongsPlayed: stats.totalSongsPlayed || 0,
-    totalPlayTime: stats.totalPlayTime || 0,
-    createdAt: room.createdAt,
-    lastActivity: room.lastActivity,
-    currentSong: room.currentSong,
-    queueLength: room.queue.length,
-    playedSongs: stats.playedSongs || []
-  });
+    const stats = await getRoomStats(roomId) || {};
+    
+    res.json({
+      roomId,
+      currentUsers: room.users.length,
+      totalUsers: stats.totalUsers || 0,
+      totalSongsPlayed: stats.totalSongsPlayed || 0,
+      totalPlayTime: stats.totalPlayTime || 0,
+      createdAt: room.createdAt,
+      lastActivity: room.lastActivity,
+      currentSong: room.currentSong,
+      queueLength: room.queue.length
+    });
+  } catch (err) {
+    console.error('Get room stats error:', err);
+    res.status(500).json({ error: 'Failed to get room statistics' });
+  }
 });
 
-// New API: Get room info (for checking if room exists and requires password)
+// Get room info
 app.get('/api/room/:roomId/info', apiLimiter, async (req, res) => {
   const { roomId } = req.params;
   
@@ -486,384 +403,383 @@ app.get('/api/room/:roomId/info', apiLimiter, async (req, res) => {
     return res.status(400).json({ error: 'Invalid room ID' });
   }
 
-  // Check active rooms first, then fall back to MongoDB
-  let room = activeRooms[roomId];
-  if (!room) {
-    room = await RoomDB.getRoom(roomId);
-    if (!room || !room.isActive) {
-      return res.status(404).json({ error: 'Room not found' });
-    }
-  }
+  try {
+    const room = await getRoom(roomId);
+    if (!room) return res.status(404).json({ error: 'Room not found' });
 
-  res.json({
-    roomId,
-    roomName: room.roomName,
-    hasPassword: !!room.password,
-    userCount: room.users ? room.users.length : 0,
-    currentSong: room.currentSong ? {
-      title: room.currentSong.title,
-      artist: room.currentSong.artist
-    } : null,
-    createdAt: room.createdAt,
-    lastActivity: room.lastActivity,
-    isActive: room.isActive
-  });
+    res.json({
+      roomId,
+      roomName: room.roomName,
+      hasPassword: !!room.password,
+      userCount: room.users.length,
+      currentSong: room.currentSong ? {
+        title: room.currentSong.title,
+        artist: room.currentSong.artist
+      } : null,
+      createdAt: room.createdAt,
+      lastActivity: room.lastActivity
+    });
+  } catch (err) {
+    console.error('Get room info error:', err);
+    res.status(500).json({ error: 'Failed to get room info' });
+  }
 });
 
-// New API: Get available rooms
+// Get available rooms
 app.get('/api/rooms', apiLimiter, async (req, res) => {
-  // Combine active in-memory rooms with any active rooms from MongoDB
-  const activeRoomIds = new Set(Object.keys(activeRooms));
-  const dbRooms = await RoomDB.getActiveRooms();
-  
-  const availableRooms = [
-    ...Object.values(activeRooms),
-    ...dbRooms.filter(room => !activeRoomIds.has(room.roomId) && room.isActive)
-  ].map(room => ({
-    roomId: room.roomId,
-    roomName: room.roomName,
-    userCount: room.users ? room.users.length : 0,
-    hasPassword: !!room.password,
-    currentSong: room.currentSong ? {
-      title: room.currentSong.title,
-      artist: room.currentSong.artist
-    } : null,
-    createdAt: room.createdAt,
-    lastActivity: room.lastActivity
-  })).filter(room => room.userCount > 0);
+  try {
+    const db = client.db();
+    const activeRooms = await db.collection('rooms')
+      .find({ lastActivity: { $gte: new Date(Date.now() - 30 * 60 * 1000).toISOString() } })
+      .toArray();
 
-  res.json({ rooms: availableRooms });
-});
+    const availableRooms = activeRooms.map(room => ({
+      roomId: room.roomId,
+      roomName: room.roomName,
+      userCount: room.users.length,
+      hasPassword: !!room.password,
+      currentSong: room.currentSong ? {
+        title: room.currentSong.title,
+        artist: room.currentSong.artist
+      } : null,
+      createdAt: room.createdAt,
+      lastActivity: room.lastActivity
+    }));
 
-// ---- Enhanced Socket.IO with MongoDB sync ----
-io.use((socket, next) => {
-  const { roomId, userId } = socket.handshake.auth;
-  if (!validateRoomId(roomId) || !validateUserId(userId)) {
-    return next(new Error('Invalid authentication'));
+    res.json({ rooms: availableRooms });
+  } catch (err) {
+    console.error('Get available rooms error:', err);
+    res.status(500).json({ error: 'Failed to get available rooms' });
   }
-  next();
 });
 
-io.on('connection', (socket) => {
+// ---- Enhanced Socket.IO with MongoDB ----
+io.use(async (socket, next) => {
+  const { roomId, userId } = socket.handshake.auth;
+  if (!validateRoomId(roomId)) {
+    return next(new Error('Invalid room ID'));
+  }
+  
+  if (!validateUserId(userId)) {
+    return next(new Error('Invalid user ID'));
+  }
+
+  try {
+    const room = await getRoom(roomId);
+    if (!room) {
+      return next(new Error('Room not found'));
+    }
+
+    const userExists = room.users.some(u => u.id === userId);
+    if (!userExists) {
+      return next(new Error('User not in room'));
+    }
+
+    next();
+  } catch (err) {
+    next(new Error('Authentication error'));
+  }
+});
+
+io.on('connection', async (socket) => {
   console.log('New socket connected:', socket.id);
   
   const { roomId, userId } = socket.handshake.auth;
-  const room = activeRooms[roomId];
   
-  if (!room) {
-    socket.emit('error', 'Room not found');
-    socket.disconnect();
-    return;
-  }
-
-  // Update user's socketId
-  const user = room.users.find(u => u.id === userId);
-  if (!user) {
-    socket.emit('error', 'User not in room');
-    socket.disconnect();
-    return;
-  }
-
-  user.socketId = socket.id;
-  socket.join(roomId);
-  room.lastActivity = new Date().toISOString();
-  
-  // Update room in MongoDB
-  RoomDB.saveRoom(room);
-
-  // Notify others
-  socket.to(roomId).emit('user_joined', { userId, user });
-  io.to(roomId).emit('room_users', room.users);
-
-  // Send current state to new user
-  if (room.currentSong) {
-    socket.emit('play_song', room.currentSong);
-  }
-  
-  // Send current playback state
-  socket.emit('sync_playback', room.playbackState);
-
-  console.log(`User ${userId} joined room ${roomId}`);
-
-  // Enhanced admin streaming with queue management
-  socket.on('admin_stream_song', async ({ song, addToQueue = false }) => {
-    if (!user.isAdmin) {
-      socket.emit('error', 'Only admin can stream');
+  try {
+    const room = await getRoom(roomId);
+    if (!room) {
+      socket.emit('error', 'Room not found');
+      socket.disconnect();
       return;
     }
 
-    console.log(`🎵 Admin ${userId} ${addToQueue ? 'adding to queue' : 'streaming'} in room ${roomId}: ${song.title}`);
-
-    // Ensure song has all necessary data for viewers
-    const songForViewers = {
-      ...song,
-      id: song.id || song._id,
-      _id: song._id || song.id,
-      mediaUrl: song.mediaUrl || song.media_url || song.downloadUrl || song.url,
-      title: song.title,
-      artist: song.artist,
-      thumbnail: song.thumbnail || song.artwork || song.cover
-    };
-
-    console.log(`📡 Song data for viewers:`, {
-      id: songForViewers.id,
-      title: songForViewers.title,
-      artist: songForViewers.artist,
-      hasMediaUrl: !!songForViewers.mediaUrl,
-      hasThumbnail: !!songForViewers.thumbnail
-    });
-
-    if (addToQueue) {
-      room.queue.push(songForViewers);
-      io.to(roomId).emit('queue_updated', { queue: room.queue });
-    } else {
-      room.currentSong = songForViewers;
-      room.playbackState = {
-        isPlaying: false,
-        position: 0,
-        songId: songForViewers.id,
-        timestamp: Date.now()
-      };
-      
-      // Update statistics
-      if (room.stats) {
-        room.stats.totalSongsPlayed++;
-        room.stats.lastSongPlayed = new Date().toISOString();
-        await RoomStatsDB.recordSongPlayed(roomId, songForViewers);
-      }
-      
-      // Send to all viewers immediately with complete data
-      socket.to(roomId).emit('play_song', songForViewers);
-      
-      // Send sync playback state to all users
-      io.to(roomId).emit('sync_playback', room.playbackState);
-      
-      console.log(`📡 Streamed song to ${room.users.length - 1} viewers in room ${roomId}`);
-    }
-    
-    // Update room in MongoDB
-    await RoomDB.saveRoom(room);
-  });
-
-  // Enhanced playback synchronization
-  socket.on('sync_playback', async (action) => {
-    if (!user.isAdmin) return;
-    
-    console.log(`🔄 Admin ${userId} syncing playback in room ${roomId}:`, action);
-    
-    room.playbackState = {
-      ...action,
-      timestamp: Date.now()
-    };
-    
-    // Broadcast to all viewers
-    socket.to(roomId).emit('sync_playback', action);
-    
-    // Update room in MongoDB
-    await RoomDB.saveRoom(room);
-  });
-
-  socket.on('sync_seek', async (time) => {
-    if (!user.isAdmin) return;
-    
-    console.log(`⏩ Admin ${userId} seeking to ${time}s in room ${roomId}`);
-    
-    room.playbackState.position = time;
-    room.playbackState.timestamp = Date.now();
-    
-    socket.to(roomId).emit('sync_seek', time);
-    
-    // Update room in MongoDB
-    await RoomDB.saveRoom(room);
-  });
-
-  // Handle song data requests from viewers
-  socket.on('request_song_data', ({ songId }) => {
-    if (!user.isAdmin) return;
-    
-    // Find the song in the room's current song or queue
-    let songData = null;
-    if (room.currentSong && (room.currentSong.id === songId || room.currentSong._id === songId)) {
-      songData = room.currentSong;
-    } else {
-      songData = room.queue.find(song => song.id === songId || song._id === songId);
-    }
-    
-    if (songData) {
-      // Send the song data back to the requesting user
-      socket.emit('song_data_response', songData);
-      console.log(`Admin sent song data for ${songId} to user ${userId}`);
-    } else {
-      console.log(`Song ${songId} not found in room ${roomId}`);
-    }
-  });
-
-  // Queue management with MongoDB sync
-  socket.on('add_to_queue', async ({ song }) => {
-    // Allow all users to add songs to queue
-    room.queue.push(song);
-    io.to(roomId).emit('queue_updated', { queue: room.queue });
-    console.log(`Song added to queue in room ${roomId}: ${song.title} by ${userId}`);
-    
-    // Update room in MongoDB
-    await RoomDB.saveRoom(room);
-  });
-
-  socket.on('remove_from_queue', async ({ songId }) => {
-    if (!user.isAdmin) return;
-    
-    const index = room.queue.findIndex(song => 
-      (song.id || song._id) === songId
+    // Update user's socketId in the room
+    const updatedUsers = room.users.map(user => 
+      user.id === userId ? { ...user, socketId: socket.id } : user
     );
     
-    if (index !== -1) {
-      room.queue.splice(index, 1);
-      io.to(roomId).emit('queue_updated', { queue: room.queue });
-      
-      // Update room in MongoDB
-      await RoomDB.saveRoom(room);
+    await updateRoom(roomId, { users: updatedUsers });
+    await updateUserSession(userId, roomId, { socketId: socket.id });
+    
+    socket.join(roomId);
+    
+    // Notify others
+    const currentUser = updatedUsers.find(u => u.id === userId);
+    socket.to(roomId).emit('user_joined', { userId, user: currentUser });
+    io.to(roomId).emit('room_users', updatedUsers);
+
+    // Send current state to new user
+    if (room.currentSong) {
+      socket.emit('play_song', room.currentSong);
     }
-  });
+    
+    // Send current playback state
+    socket.emit('sync_playback', room.playbackState);
 
-  socket.on('play_next', async () => {
-    if (!user.isAdmin) return;
-    
-    if (room.queue.length > 0) {
-      const nextSong = room.queue.shift();
-      room.currentSong = nextSong;
-      room.playbackState = {
-        isPlaying: false,
-        position: 0,
-        songId: nextSong.id || nextSong._id,
-        timestamp: Date.now()
-      };
-      
-      io.to(roomId).emit('play_song', nextSong);
-      io.to(roomId).emit('sync_playback', room.playbackState);
-      io.to(roomId).emit('queue_updated', { queue: room.queue });
-      
-      // Update statistics
-      if (room.stats) {
-        room.stats.totalSongsPlayed++;
-        room.stats.lastSongPlayed = new Date().toISOString();
-        await RoomStatsDB.recordSongPlayed(roomId, nextSong);
-      }
-      
-      // Update room in MongoDB
-      await RoomDB.saveRoom(room);
-    }
-  });
+    console.log(`User ${userId} joined room ${roomId}`);
 
-  // Room settings management with MongoDB sync
-  socket.on('update_room_settings', async (settings) => {
-    if (!user.isAdmin) return;
-    
-    room.settings = { ...room.settings, ...settings };
-    io.to(roomId).emit('room_settings_updated', room.settings);
-    
-    // Update room in MongoDB
-    await RoomDB.saveRoom(room);
-  });
-
-  // Enhanced room management with MongoDB sync
-  socket.on('promote_user', async ({ targetUserId }) => {
-    if (!user.isAdmin) return;
-    
-    const targetUser = room.users.find(u => u.id === targetUserId);
-    if (targetUser) {
-      targetUser.isAdmin = true;
-      io.to(roomId).emit('user_promoted', { userId: targetUserId });
-      io.to(roomId).emit('room_users', room.users);
-      
-      // Update room in MongoDB
-      await RoomDB.saveRoom(room);
-    }
-  });
-
-  socket.on('kick_user', async ({ targetUserId }) => {
-    if (!user.isAdmin) return;
-    
-    const targetUser = room.users.find(u => u.id === targetUserId);
-    if (targetUser && !targetUser.isAdmin) {
-      const targetSocket = io.sockets.sockets.get(targetUser.socketId);
-      if (targetSocket) {
-        targetSocket.emit('kicked_from_room', { reason: 'Kicked by admin' });
-        targetSocket.disconnect();
-      }
-      
-      const index = room.users.findIndex(u => u.id === targetUserId);
-      if (index !== -1) {
-        room.users.splice(index, 1);
-        io.to(roomId).emit('user_left', targetUserId);
-        io.to(roomId).emit('room_users', room.users);
+    // Enhanced admin streaming with queue management
+    socket.on('admin_stream_song', async ({ song, addToQueue = false }) => {
+      try {
+        const room = await getRoom(roomId);
+        if (!room) return;
         
-        // Update user session in MongoDB
-        await UserDB.removeUserFromRoom(targetUserId);
-        
-        // Update room in MongoDB
-        await RoomDB.saveRoom(room);
-      }
-    }
-  });
+        const user = room.users.find(u => u.id === userId);
+        if (!user || !user.isAdmin) {
+          socket.emit('error', 'Only admin can stream');
+          return;
+        }
 
-  // Enhanced disconnection handling with MongoDB sync
-  socket.on('disconnect', async () => {
-    console.log(`User ${userId} disconnected from room ${roomId}`);
-    
-    const index = room.users.findIndex(u => u.id === userId);
-    if (index !== -1) {
-      room.users.splice(index, 1);
-      room.lastActivity = new Date().toISOString();
-      
-      io.to(roomId).emit('user_left', userId);
-      io.to(roomId).emit('room_users', room.users);
-      
-      // Update user session in MongoDB
-      await UserDB.removeUserFromRoom(userId);
-      
-      // If admin left and there are other users, promote the first user
-      if (user.isAdmin && room.users.length > 0) {
-        room.users[0].isAdmin = true;
-        io.to(roomId).emit('user_promoted', { userId: room.users[0].id });
-        io.to(roomId).emit('room_users', room.users);
+        console.log(`🎵 Admin ${userId} ${addToQueue ? 'adding to queue' : 'streaming'} in room ${roomId}: ${song.title}`);
+
+        const songForViewers = {
+          ...song,
+          id: song.id || song._id,
+          _id: song._id || song.id,
+          mediaUrl: song.mediaUrl || song.media_url || song.downloadUrl || song.url,
+          title: song.title,
+          artist: song.artist,
+          thumbnail: song.thumbnail || song.artwork || song.cover
+        };
+
+        if (addToQueue) {
+          const updatedQueue = [...room.queue, songForViewers];
+          await updateRoom(roomId, { queue: updatedQueue });
+          io.to(roomId).emit('queue_updated', { queue: updatedQueue });
+        } else {
+          const playbackState = {
+            isPlaying: false,
+            position: 0,
+            songId: songForViewers.id,
+            timestamp: Date.now()
+          };
+          
+          await updateRoom(roomId, { 
+            currentSong: songForViewers,
+            playbackState
+          });
+          
+          // Update statistics
+          const stats = await getRoomStats(roomId);
+          if (stats) {
+            await updateRoomStats(roomId, {
+              totalSongsPlayed: (stats.totalSongsPlayed || 0) + 1,
+              lastSongPlayed: new Date().toISOString()
+            });
+          }
+          
+          // Send to all viewers
+          socket.to(roomId).emit('play_song', songForViewers);
+          io.to(roomId).emit('sync_playback', playbackState);
+        }
+      } catch (err) {
+        console.error('Admin stream error:', err);
       }
-      
-      // Update room in MongoDB
-      await RoomDB.saveRoom(room);
-    }
-    
-    // Clear room data if empty
-    if (room.users.length === 0) {
-      if (room.stats) {
-        console.log(`Room ${roomId} statistics:`, room.stats);
-        await RoomStatsDB.saveStats(roomId, room.stats);
+    });
+
+    // Enhanced playback synchronization
+    socket.on('sync_playback', async (action) => {
+      try {
+        const room = await getRoom(roomId);
+        if (!room) return;
+        
+        const user = room.users.find(u => u.id === userId);
+        if (!user || !user.isAdmin) return;
+        
+        const playbackState = {
+          ...action,
+          timestamp: Date.now()
+        };
+        
+        await updateRoom(roomId, { playbackState });
+        socket.to(roomId).emit('sync_playback', playbackState);
+      } catch (err) {
+        console.error('Sync playback error:', err);
       }
+    });
+
+    socket.on('sync_seek', async (time) => {
+      try {
+        const room = await getRoom(roomId);
+        if (!room) return;
+        
+        const user = room.users.find(u => u.id === userId);
+        if (!user || !user.isAdmin) return;
+        
+        const playbackState = {
+          ...room.playbackState,
+          position: time,
+          timestamp: Date.now()
+        };
+        
+        await updateRoom(roomId, { playbackState });
+        socket.to(roomId).emit('sync_seek', time);
+      } catch (err) {
+        console.error('Sync seek error:', err);
+      }
+    });
+
+    // Queue management
+    socket.on('add_to_queue', async ({ song }) => {
+      try {
+        const room = await getRoom(roomId);
+        if (!room) return;
+        
+        const user = room.users.find(u => u.id === userId);
+        if (!room.settings.allowUserRequests && (!user || !user.isAdmin)) {
+          socket.emit('error', 'User requests not allowed in this room');
+          return;
+        }
+        
+        const updatedQueue = [...room.queue, song];
+        await updateRoom(roomId, { queue: updatedQueue });
+        io.to(roomId).emit('queue_updated', { queue: updatedQueue });
+      } catch (err) {
+        console.error('Add to queue error:', err);
+      }
+    });
+
+    socket.on('remove_from_queue', async ({ songId }) => {
+      try {
+        const room = await getRoom(roomId);
+        if (!room) return;
+        
+        const user = room.users.find(u => u.id === userId);
+        if (!user || !user.isAdmin) return;
+        
+        const updatedQueue = room.queue.filter(song => 
+          (song.id || song._id) !== songId
+        );
+        
+        if (updatedQueue.length !== room.queue.length) {
+          await updateRoom(roomId, { queue: updatedQueue });
+          io.to(roomId).emit('queue_updated', { queue: updatedQueue });
+        }
+      } catch (err) {
+        console.error('Remove from queue error:', err);
+      }
+    });
+
+    socket.on('play_next', async () => {
+      try {
+        const room = await getRoom(roomId);
+        if (!room) return;
+        
+        const user = room.users.find(u => u.id === userId);
+        if (!user || !user.isAdmin) return;
+        
+        if (room.queue.length > 0) {
+          const nextSong = room.queue[0];
+          const updatedQueue = room.queue.slice(1);
+          
+          const playbackState = {
+            isPlaying: false,
+            position: 0,
+            songId: nextSong.id || nextSong._id,
+            timestamp: Date.now()
+          };
+          
+          await updateRoom(roomId, {
+            currentSong: nextSong,
+            queue: updatedQueue,
+            playbackState
+          });
+          
+          // Update statistics
+          const stats = await getRoomStats(roomId);
+          if (stats) {
+            await updateRoomStats(roomId, {
+              totalSongsPlayed: (stats.totalSongsPlayed || 0) + 1,
+              lastSongPlayed: new Date().toISOString()
+            });
+          }
+          
+          io.to(roomId).emit('play_song', nextSong);
+          io.to(roomId).emit('sync_playback', playbackState);
+          io.to(roomId).emit('queue_updated', { queue: updatedQueue });
+        }
+      } catch (err) {
+        console.error('Play next error:', err);
+      }
+    });
+
+    // Room settings management
+    socket.on('update_room_settings', async (settings) => {
+      try {
+        const room = await getRoom(roomId);
+        if (!room) return;
+        
+        const user = room.users.find(u => u.id === userId);
+        if (!user || !user.isAdmin) return;
+        
+        await updateRoom(roomId, {
+          settings: { ...room.settings, ...settings }
+        });
+        
+        io.to(roomId).emit('room_settings_updated', { ...room.settings, ...settings });
+      } catch (err) {
+        console.error('Update room settings error:', err);
+      }
+    });
+
+    // Enhanced disconnection handling
+    socket.on('disconnect', async () => {
+      console.log(`User ${userId} disconnected from room ${roomId}`);
       
-      // Mark room as inactive in MongoDB
-      await RoomDB.saveRoom({
-        ...room,
-        isActive: false,
-        endedAt: new Date().toISOString()
-      });
-      
-      delete activeRooms[roomId];
-      console.log(`Room ${roomId} cleared immediately after last user disconnected.`);
-    }
-  });
+      try {
+        const room = await getRoom(roomId);
+        if (!room) return;
+        
+        const userIndex = room.users.findIndex(u => u.id === userId);
+        if (userIndex === -1) return;
+        
+        const updatedUsers = [...room.users];
+        const disconnectedUser = updatedUsers[userIndex];
+        updatedUsers.splice(userIndex, 1);
+        
+        await updateRoom(roomId, {
+          users: updatedUsers,
+          lastActivity: new Date().toISOString()
+        });
+        
+        await deleteUserSession(userId, roomId);
+        
+        io.to(roomId).emit('user_left', userId);
+        io.to(roomId).emit('room_users', updatedUsers);
+        
+        // If admin left and there are other users, promote the first user
+        if (disconnectedUser.isAdmin && updatedUsers.length > 0) {
+          const newAdmin = updatedUsers[0];
+          updatedUsers[0] = { ...newAdmin, isAdmin: true };
+          
+          await updateRoom(roomId, { users: updatedUsers });
+          
+          io.to(roomId).emit('user_promoted', { userId: newAdmin.id });
+          io.to(roomId).emit('room_users', updatedUsers);
+        }
+      } catch (err) {
+        console.error('Disconnection handling error:', err);
+      }
+    });
+
+  } catch (err) {
+    console.error('Socket connection error:', err);
+    socket.emit('error', 'Connection error');
+    socket.disconnect();
+  }
 });
 
 // ---- Start Server ----
-connectToMongoDB().then(() => {
-  server.listen(PORT, () => {
-    console.log(`Enhanced Music Room Server with MongoDB running at http://localhost:${PORT}`);
-    console.log('Features:');
-    console.log('- Real-time synchronized music playback');
-    console.log('- Persistent room data with MongoDB');
-    console.log('- Queue management with user requests');
-    console.log('- Room statistics and analytics with historical data');
-    console.log('- Enhanced user management with session tracking');
-    console.log('- Auto-promotion when admin leaves');
-  });
+server.listen(PORT, () => {
+  console.log(`Enhanced Music Room Server running at http://localhost:${PORT}`);
+  console.log('Features:');
+  console.log('- Real-time synchronized music playback');
+  console.log('- Queue management with user requests');
+  console.log('- Room statistics and analytics');
+  console.log('- Enhanced user management');
+  console.log('- Auto-promotion when admin leaves');
+  console.log('- MongoDB Atlas storage');
 });
 
 process.on('unhandledRejection', (err) => {
@@ -872,4 +788,17 @@ process.on('unhandledRejection', (err) => {
 
 process.on('uncaughtException', (err) => {
   console.error('Uncaught exception:', err);
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('Shutting down server...');
+  try {
+    await client.close();
+    server.close();
+    process.exit(0);
+  } catch (err) {
+    console.error('Shutdown error:', err);
+    process.exit(1);
+  }
 });
